@@ -300,8 +300,10 @@ def extract_node_features(addr, is_center, tx_types, cache_dict=None):
     tx_values = np.zeros(len(tx_types), dtype=np.float32)
     tx_age = np.zeros(len(tx_types), dtype=np.float32)  # Latest transaction timestamp
     
-    # Only read these columns to improve efficiency
-    columns_to_read = ['value', 'timeStamp']
+    # tokenDecimal is required to interpret ERC20 integer values. Legacy ERC20
+    # files without it are counted but their monetary value is treated as
+    # unknown (zero), rather than incorrectly interpreted as ETH.
+    columns_to_read = ['value', 'timeStamp', 'tokenDecimal']
     max_rows = 20000  # Limit to 20,000 rows per file
     
     # Process all transaction types
@@ -328,7 +330,8 @@ def extract_node_features(addr, is_center, tx_types, cache_dict=None):
                 engine='c',      # Use C engine for faster processing
                 dtype={          # Specify data types to avoid inference
                     'value': np.float64,
-                    'timeStamp': np.float64
+                    'timeStamp': np.float64,
+                    'tokenDecimal': np.float64
                 }
             )
             
@@ -339,8 +342,18 @@ def extract_node_features(addr, is_center, tx_types, cache_dict=None):
             # Calculate transaction value and latest timestamp
             if 'value' in tx_df.columns and tx_count > 0:
                 # Ensure valid numerical values
-                values = pd.to_numeric(tx_df['value'], errors='coerce')
-                tx_values[i] = values.sum(skipna=True)
+                values = pd.to_numeric(tx_df['value'], errors='coerce').fillna(0.0)
+                if tx_type in ('Normal', 'Internal'):
+                    tx_values[i] = (values / 1e18).sum(skipna=True)
+                elif 'tokenDecimal' in tx_df.columns:
+                    decimals = pd.to_numeric(tx_df['tokenDecimal'], errors='coerce')
+                    valid = decimals.notna() & decimals.between(0, 36)
+                    normalized = pd.Series(0.0, index=tx_df.index)
+                    normalized.loc[valid] = (
+                        values.loc[valid]
+                        / np.power(10.0, decimals.loc[valid].astype(float))
+                    )
+                    tx_values[i] = normalized.sum(skipna=True)
                 
             if 'timeStamp' in tx_df.columns and tx_count > 0:
                 # Ensure valid timestamps
@@ -353,7 +366,11 @@ def extract_node_features(addr, is_center, tx_types, cache_dict=None):
     
     # Create derived features
     total_tx_count = np.sum(tx_counts)
-    total_value = np.sum(tx_values)
+    # A total across ETH and heterogeneous token units has no monetary meaning.
+    # Keep per-type values, but define the aggregate as native ETH only.
+    eth_type_indices = [i for i, tx_type in enumerate(tx_types)
+                        if tx_type in ('Normal', 'Internal')]
+    total_value = np.sum(tx_values[eth_type_indices])
     tx_count_ratios = tx_counts / (total_tx_count + 1e-8)  # Avoid division by zero
     
     # Combine all features

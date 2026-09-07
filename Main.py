@@ -27,13 +27,20 @@ parser.add_argument("--output_dir", type=str, default=None,
                     help="输出结果目录（默认自动生成）")
 parser.add_argument("--cache_dir", type=str, default=None, 
                     help="图缓存目录（默认自动生成）")
+parser.add_argument("--max_neighbors", type=int, default=200,
+                    help="最大邻居数量（用于定位默认图缓存目录）")
+parser.add_argument("--max_txs", type=int, default=200,
+                    help="每个邻居的最大交易数量（用于定位默认图缓存目录）")
 args = parser.parse_args()
 
 DATASET_NAME = args.dataset
 if args.cache_dir:
     CACHE_DIR = args.cache_dir
 else:
-    CACHE_DIR = f"./Dataset/graph_cache_multigraph_{DATASET_NAME}_maxneighbors20_maxtxs20"
+    CACHE_DIR = (
+        f"./Dataset/graph_cache_multigraph_{DATASET_NAME}_"
+        f"maxneighbors{args.max_neighbors}_maxtxs{args.max_txs}"
+    )
 
 if args.output_dir:
     OUTPUT_ROOT = args.output_dir
@@ -57,7 +64,7 @@ config = {
     "warmup_epochs": 5,
     "epochs": 250,
     "patience": 30,
-    "seed": 123,
+    "seed": 24,
     "num_folds": 5,
     "two_stage_epochs": 80
 }

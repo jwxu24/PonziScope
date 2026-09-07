@@ -80,10 +80,10 @@ python Dataset.py --extract_neighbor_features
 
 ```bash
 # 为 Dataset1 构建图缓存
-python Graph_cache_builder.py --dataset Dataset1 --max_neighbors 20 --max_txs 20
+python Graph_cache_builder.py --dataset Dataset1 --max_neighbors 200 --max_txs 200
 
 # 为 Dataset2 构建图缓存
-python Graph_cache_builder.py --dataset Dataset2 --max_neighbors 20 --max_txs 20
+python Graph_cache_builder.py --dataset Dataset2 --max_neighbors 200 --max_txs 200
 ```
 
 ### 步骤3：训练模型 / Step 3: Train Model
@@ -92,10 +92,10 @@ python Graph_cache_builder.py --dataset Dataset2 --max_neighbors 20 --max_txs 20
 
 ```bash
 # 使用 Dataset1 训练
-python Main.py --dataset Dataset1
+python Main.py --dataset Dataset1 --max_neighbors 200 --max_txs 200
 
 # 使用 Dataset2 训练
-python Main.py --dataset Dataset2
+python Main.py --dataset Dataset2 --max_neighbors 200 --max_txs 200
 ```
 
 ---
@@ -121,8 +121,8 @@ python Main.py --dataset Dataset2
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--dataset` | str | Dataset1 | 数据集名称（Dataset1 或 Dataset2） |
-| `--max_neighbors` | int | 50 | 每个中心节点保留的最大邻居数 |
-| `--max_txs` | int | 20 | 每个邻居节点保留的最大交易数 |
+| `--max_neighbors` | int | 200 | 每个中心节点保留的最大邻居数 |
+| `--max_txs` | int | 200 | 每个邻居节点保留的最大交易数 |
 | `--cache_dir` | str | None | 自定义缓存目录路径 |
 
 ### Main.py 参数
@@ -132,6 +132,8 @@ python Main.py --dataset Dataset2
 | `--dataset` | str | Dataset1 | 数据集名称（Dataset1 或 Dataset2） |
 | `--output_dir` | str | None | 自定义输出目录路径 |
 | `--cache_dir` | str | None | 自定义图缓存目录路径 |
+| `--max_neighbors` | int | 200 | 构图时的最大邻居数，用于定位默认缓存目录 |
+| `--max_txs` | int | 200 | 每个邻居的最大交易数，用于定位默认缓存目录 |
 
 ---
 
@@ -139,7 +141,7 @@ python Main.py --dataset Dataset2
 
 ### 图缓存目录 / Graph Cache Directory
 
-图缓存文件保存在 `./Dataset/graph_cache_multigraph_{DATASET}_maxneighbors{N}_maxtxs{N}/` 目录下，每个地址对应一个 `.pt` 文件。
+图缓存文件保存在 `./Dataset/graph_cache_multigraph_{DATASET}_maxneighbors{K}_maxtxs{M}/` 目录下，每个地址对应一个 `.pt` 文件。论文主实验配置为 `K=200, M=200`。
 
 ### 训练结果 / Training Results
 

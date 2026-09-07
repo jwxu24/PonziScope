@@ -86,11 +86,16 @@ class DataSource:
             
         return self._get_etherscan_data("account", action, address, startblock, endblock, page, offset, sort, **kwargs)
 
-    # 核心交易列 - Graph_construction.py needs
-    CORE_COLUMNS = ['blockNumber', 'from', 'to', 'value', 'gasUsed', 'gasPrice', 'timeStamp']
+    # Core transaction columns used by Graph_construction.py.  ERC20 metadata
+    # must be retained: token ``value`` is an integer in the token's smallest
+    # unit and cannot be converted with the ETH 1e18 divisor.
+    CORE_COLUMNS = [
+        'blockNumber', 'from', 'to', 'value', 'gasUsed', 'gasPrice', 'timeStamp',
+        'contractAddress', 'tokenDecimal', 'tokenSymbol'
+    ]
     
     def getTotalDatafromScan(self, address, ttype, saved_path, start_number=0, end_number=99999999):
-        """Fetch all transactions of a specific type and save to CSV (only core columns)"""
+        """Fetch transactions and retain the metadata required for unit-safe values."""
         saved_path_address = f"{saved_path}{address}.csv"
         response_list = []
         
@@ -116,8 +121,12 @@ class DataSource:
                 
             # 只保留核心列，减少数据量
             filtered_response = []
+            metadata_columns = {'contractAddress', 'tokenDecimal', 'tokenSymbol'}
             for tx in response:
-                filtered_tx = {col: tx.get(col, '0') for col in self.CORE_COLUMNS}
+                filtered_tx = {
+                    col: tx.get(col, '' if col in metadata_columns else '0')
+                    for col in self.CORE_COLUMNS
+                }
                 filtered_response.append(filtered_tx)
             
             response_list.extend(filtered_response)

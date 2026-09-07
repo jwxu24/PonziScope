@@ -11,9 +11,9 @@ from Graph_construction import build_two_layer_multigraph
 parser = argparse.ArgumentParser(description="Build and cache multigraph dataset")
 parser.add_argument("--dataset", type=str, default="Dataset1", 
                     choices=["Dataset1", "Dataset2"], help="选择数据集")
-parser.add_argument("--max_neighbors", type=int, default=50, 
+parser.add_argument("--max_neighbors", type=int, default=200, 
                     help="最大邻居数量")
-parser.add_argument("--max_txs", type=int, default=20, 
+parser.add_argument("--max_txs", type=int, default=200, 
                     help="每个邻居的最大交易数量")
 parser.add_argument("--cache_dir", type=str, default=None, 
                     help="缓存目录（默认自动生成）")
