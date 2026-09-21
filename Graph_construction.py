@@ -6,45 +6,80 @@ from torch_geometric.data import Data
 from sklearn.preprocessing import StandardScaler
 import warnings
 import time
-warnings.filterwarnings("ignore")
+from pathlib import Path
+from Data_protocol import ROOT, END_BLOCK
 
-def _load_all_txs_for_address(address, is_target=True):
-    all_txs_dfs = []
-    core_columns = {
-        'blockNumber': 'str', 'from': 'str', 'to': 'str', 'value': 'str',
-        'gasUsed': 'str', 'gasPrice': 'str', 'timeStamp': 'str',
-        'contractAddress': 'str', 'tokenDecimal': 'str', 'tokenSymbol': 'str'
-    }
-    tx_type_mapping = {'Normal': 0, 'Internal': 1, 'ERC20': 2}
-
-    base_dir = 'Dataset/PonziCombine/RelatedTransactions' if is_target else 'Dataset/PonziCombine/RelatedAddressTransactions'
-
-    for tx_type in ['Normal', 'Internal', 'ERC20']:
-        file_path = f'{base_dir}/{tx_type}/{address}.csv'
-        if not os.path.exists(file_path):
-            continue
-        
-        address_tx_df = pd.read_csv(file_path, dtype=str, engine='c')
-        standard_df = pd.DataFrame()
-
-        metadata_columns = {'contractAddress', 'tokenDecimal', 'tokenSymbol'}
-        for col in core_columns.keys():
-            if col in address_tx_df.columns:
-                standard_df[col] = address_tx_df[col]
+def deduplicate_transactions(df):
+    result = df.copy()
+    identities = []
+    for row in result.to_dict('records'):
+        tx_hash = str(row.get('hash', '')).strip().lower()
+        tx_type = int(row['tx_type'])
+        identity = None
+        if tx_hash and tx_hash != 'nan':
+            if tx_type == 0:
+                identity = f'0:{tx_hash}'
             else:
-                standard_df[col] = '' if col in metadata_columns else '0'
-        
-        standard_df['tx_type'] = tx_type_mapping[tx_type]
-        all_txs_dfs.append(standard_df)
+                discriminator = str(row.get('traceId' if tx_type == 1 else 'logIndex', '')).strip()
+                if discriminator and discriminator != 'nan':
+                    identity = f'{tx_type}:{tx_hash}:{discriminator}'
+        identities.append(identity)
+    keys = pd.Series(identities, index=result.index, dtype=object)
+    return result.loc[keys.isna() | ~keys.duplicated()].reset_index(drop=True)
 
-    if not all_txs_dfs:
+
+def _load_all_txs_for_address(address, is_target=True, end_block=END_BLOCK,
+                              cutoff_timestamp=None, data_root=None):
+    address = address.strip().lower()
+    data_root = Path(data_root) if data_root is not None else ROOT / 'Dataset' / 'PonziCombine'
+    base_dir = data_root / ('RelatedTransactions' if is_target else 'RelatedAddressTransactions')
+    parts = []
+    if not any((base_dir / name / f'{address}.csv').exists() for name in ['Normal', 'Internal', 'ERC20']):
+        raise FileNotFoundError(f'No transaction files for {address} in {base_dir}')
+    metadata = ['contractAddress', 'tokenDecimal', 'tokenSymbol', 'hash', 'traceId',
+                'logIndex', 'transactionIndex', 'isError', 'txreceipt_status']
+    for tx_type, name in enumerate(['Normal', 'Internal', 'ERC20']):
+        path = base_dir / name / f'{address}.csv'
+        if not path.exists():
+            continue
+        try:
+            part = pd.read_csv(path, dtype=str).fillna('')
+        except pd.errors.EmptyDataError:
+            continue
+        if part.empty:
+            continue
+        required = {'blockNumber', 'timeStamp', 'from', 'to', 'value'}
+        if not required.issubset(part.columns):
+            raise ValueError(f'Missing transaction columns in {path}: {sorted(required - set(part.columns))}')
+        for name in metadata:
+            if name not in part:
+                part[name] = ''
+        for name in ['gasUsed', 'gasPrice']:
+            if name not in part:
+                part[name] = '0'
+        part['tx_type'] = tx_type
+        for name in ['from', 'to', 'contractAddress', 'hash']:
+            part[name] = part[name].astype(str).str.strip().str.lower()
+        if tx_type == 0:
+            creation = part['to'].eq('')
+            part.loc[creation, 'to'] = part.loc[creation, 'contractAddress']
+        valid = part['from'].str.fullmatch(r'0x[0-9a-f]{40}') & part['to'].str.fullmatch(r'0x[0-9a-f]{40}')
+        valid &= part['from'].eq(address) | part['to'].eq(address)
+        valid &= ~part['isError'].isin(['1', 'true']) & ~part['txreceipt_status'].eq('0')
+        for name in ['blockNumber', 'timeStamp']:
+            part[name] = pd.to_numeric(part[name], errors='coerce')
+            valid &= part[name].notna() & part[name].ge(0)
+        valid &= part['blockNumber'].le(end_block)
+        if cutoff_timestamp is not None:
+            valid &= part['timeStamp'].le(cutoff_timestamp)
+        part = part.loc[valid].copy()
+        if not part.empty:
+            parts.append(part)
+    if not parts:
         return None
-
-    combined_tx_df = pd.concat(all_txs_dfs, ignore_index=True)
-    combined_tx_df['blockNumber'] = pd.to_numeric(combined_tx_df['blockNumber'], errors='coerce')
-    combined_tx_df['timeStamp'] = pd.to_numeric(combined_tx_df['timeStamp'], errors='coerce')
-    combined_tx_df.dropna(subset=['blockNumber', 'timeStamp'], inplace=True)
-    return _add_unit_safe_values(combined_tx_df)
+    combined = deduplicate_transactions(pd.concat(parts, ignore_index=True))
+    combined = combined.sort_values(['timeStamp', 'blockNumber', 'hash', 'traceId', 'logIndex'], kind='stable')
+    return _add_unit_safe_values(combined.reset_index(drop=True))
 
 
 def _add_unit_safe_values(df):
@@ -87,7 +122,7 @@ def _build_graph_from_df(df, center_address=None):
     if df is None or df.empty:
         return None, None
 
-    all_nodes = pd.unique(df[['from', 'to']].values.ravel('K'))
+    all_nodes = sorted(pd.unique(df[['from', 'to']].values.ravel('K')))
     addr_to_index = {addr: i for i, addr in enumerate(all_nodes)}
 
     edge_index, edge_attr = extract_edge_features(df, addr_to_index, center_address)
@@ -100,22 +135,9 @@ def _build_graph_from_df(df, center_address=None):
     if center_address in addr_to_index:
         center_flag[addr_to_index[center_address]] = 1.0
 
-    scaler = StandardScaler()
-    feature_cols = ordered_feature_df.columns
-    processed = ordered_feature_df.copy()
-    for col in feature_cols:
-        processed[col] = np.nan_to_num(processed[col], nan=0.0, posinf=1e6, neginf=-1e6)
-        if processed[col].nunique() > 1:
-            positive = processed[col] > 0
-            if positive.any():
-                processed.loc[positive, col] = np.log1p(processed.loc[positive, col])
-        processed[col] = np.clip(processed[col], -1e6, 1e6)
-
-    non_const = [c for c in feature_cols if processed[c].nunique() > 1]
-    if non_const:
-        processed[non_const] = scaler.fit_transform(processed[non_const])
-    processed = np.nan_to_num(processed.values, nan=0.0)
-    processed = np.clip(processed, -10, 10)
+    processed = np.nan_to_num(ordered_feature_df.to_numpy(dtype=float), nan=0.0, posinf=1e6, neginf=-1e6)
+    processed = np.sign(processed) * np.log1p(np.abs(processed))
+    processed = np.clip(StandardScaler().fit_transform(processed), -10, 10)
 
     x = torch.tensor(processed, dtype=torch.float32)
     x = torch.cat([x, center_flag], dim=1)  
@@ -129,7 +151,7 @@ def extract_edge_features(df, addr_to_index, center_address=None):
     edges_df['to_idx'] = edges_df['to'].map(addr_to_index)
     edges_df.dropna(subset=['from_idx', 'to_idx'], inplace=True)
 
-    edge_index = torch.tensor([edges_df['from_idx'].values, edges_df['to_idx'].values], dtype=torch.long)
+    edge_index = torch.tensor(np.stack([edges_df['from_idx'].values, edges_df['to_idx'].values]), dtype=torch.long)
 
     if 'value_normalized' not in edges_df.columns:
         edges_df = _add_unit_safe_values(edges_df)
@@ -155,108 +177,67 @@ def extract_edge_features(df, addr_to_index, center_address=None):
         if center_idx != -1:
             mask_from = edges_df['from_idx'] == center_idx
             mask_to = edges_df['to_idx'] == center_idx
-            is_center_edge[mask_from | mask_to] = 1.0
+            is_center_edge[torch.tensor((mask_from | mask_to).to_numpy(), dtype=torch.bool)] = 1.0
 
     edge_attr = torch.tensor(features.values, dtype=torch.float32)
     edge_attr = torch.cat([edge_attr, is_center_edge], dim=1)
 
     return edge_index, edge_attr
 
-def build_two_layer_multigraph(address, max_neighbors=200, center_address=None, max_txs=200):
-    target_tx_df = _load_all_txs_for_address(address, is_target=True)
-    if target_tx_df is None:
+def select_neighbors(target_tx_df, address, max_neighbors=200):
+    if max_neighbors < 0:
+        raise ValueError('max_neighbors must be nonnegative')
+    address = address.strip().lower()
+    positive = target_tx_df[target_tx_df['value_eth'].gt(0)]
+    deposits = positive[positive['to'].eq(address) & ~positive['from'].eq(address)]
+    withdrawals = positive[positive['from'].eq(address) & ~positive['to'].eq(address)]
+    deposited = deposits.groupby('from')['value_eth'].sum()
+    withdrawn = withdrawals.groupby('to')['value_eth'].sum()
+    withdrawal_counts = withdrawals.groupby('to').size()
+    shared = deposited.index.intersection(withdrawn.index)
+    profitable = set(shared[withdrawn.reindex(shared).to_numpy() > deposited.reindex(shared).to_numpy()])
+    withdrawal_only = set(withdrawal_counts[withdrawal_counts.ge(2)].index) - set(deposited.index)
+    large = set(deposited[deposited.gt(deposited.quantile(0.8))].index) if not deposited.empty else set()
+    candidates = profitable | withdrawal_only | large
+    interactions = target_tx_df[target_tx_df['from'].eq(address) | target_tx_df['to'].eq(address)]
+    outgoing = interactions[['to', 'timeStamp']].rename(columns={'to': 'address'})
+    incoming = interactions[['from', 'timeStamp']].rename(columns={'from': 'address'})
+    last_seen = pd.concat([outgoing, incoming]).groupby('address')['timeStamp'].max().to_dict()
+    return sorted(candidates, key=lambda node: (-last_seen[node], node))[:max_neighbors]
+
+
+def build_two_layer_multigraph(address, max_neighbors=200, center_address=None, max_txs=200,
+                               end_block=END_BLOCK, cutoff_timestamp=None,
+                               history_fraction=1.0, data_root=None):
+    if max_neighbors < 0 or max_txs < 1 or not 0 < history_fraction <= 1:
+        raise ValueError('Require K >= 0, M >= 1 and 0 < history_fraction <= 1')
+    address = address.strip().lower()
+    target_tx_df = _load_all_txs_for_address(address, True, end_block, cutoff_timestamp, data_root)
+    if target_tx_df is None or target_tx_df.empty:
         return None, None, []
- 
-    deposit_addresses = []
-    withdrawal_addresses = []
-  
-    deposit_amounts = {}
-    withdrawal_amounts = {}
-    
-    for _, row in target_tx_df.iterrows():
-        from_addr = row['from']
-        to_addr = row['to']
-        # Behavioral tiers model native-ETH redistribution. ERC20 quantities
-        # are token-specific and must not be compared or summed with ETH.
-        value = float(row['value_eth'])
-        
-        if to_addr == address and value > 0:
-            deposit_addresses.append(from_addr)
-            deposit_amounts[from_addr] = deposit_amounts.get(from_addr, 0) + value
-        
-        elif from_addr == address and value > 0:
-            withdrawal_addresses.append(to_addr)
-            withdrawal_amounts[to_addr] = withdrawal_amounts.get(to_addr, 0) + value
-    
-    from collections import Counter
-    deposit_counter = Counter(deposit_addresses)
-    withdrawal_counter = Counter(withdrawal_addresses)
-    
-    important_addresses = set()
-    
-    both_behavior_addrs = set(deposit_counter.keys()) & set(withdrawal_counter.keys())
-    for addr in both_behavior_addrs:
-        if deposit_counter[addr] >= 2 and withdrawal_counter[addr] >= 1:
-            important_addresses.add(addr)
-    
-    only_withdrawal_addrs = set(withdrawal_counter.keys()) - set(deposit_counter.keys())
-    for addr in only_withdrawal_addrs:
-        if withdrawal_counter[addr] >= 2 or withdrawal_amounts.get(addr, 0) > 0:
-            important_addresses.add(addr)
-    
-    large_depositors = []
-    for addr, amount in deposit_amounts.items():
-        if amount > np.percentile(list(deposit_amounts.values()), 80):
-            large_depositors.append(addr)
-    
-    all_important = list(important_addresses) + large_depositors
-    if len(all_important) > max_neighbors:
-        sorted_addrs = []
-        
-        both_behavior = [addr for addr in all_important if addr in both_behavior_addrs]
-        sorted_addrs.extend(both_behavior)
-        
-        only_withdrawal = [addr for addr in all_important if addr in only_withdrawal_addrs]
-        sorted_addrs.extend(only_withdrawal)
-        
-        large_deposit_only = [addr for addr in all_important 
-                            if addr not in both_behavior_addrs and addr not in only_withdrawal_addrs]
-        sorted_addrs.extend(large_deposit_only)
-        
-        all_neighbors = sorted_addrs[:max_neighbors]
-    else:
-        all_neighbors = all_important
-  
+    if history_fraction < 1:
+        observed_count = max(1, int(np.ceil(len(target_tx_df) * history_fraction)))
+        fraction_cutoff = float(target_tx_df.iloc[observed_count - 1]['timeStamp'])
+        cutoff_timestamp = fraction_cutoff if cutoff_timestamp is None else min(cutoff_timestamp, fraction_cutoff)
+        target_tx_df = target_tx_df[target_tx_df['timeStamp'].le(cutoff_timestamp)].copy()
+    neighbors = select_neighbors(target_tx_df, address, max_neighbors)
     neighbor_graphs = []
     neighbor_dfs = []
-    
-    for neighbor in all_neighbors:
-        neighbor_tx_df = _load_all_txs_for_address(neighbor, is_target=False)
-        if neighbor_tx_df is None:
+    for neighbor in neighbors:
+        neighbor_tx_df = _load_all_txs_for_address(neighbor, False, end_block, cutoff_timestamp, data_root)
+        if neighbor_tx_df is None or neighbor_tx_df.empty:
             continue
-        
-        if len(neighbor_tx_df) > max_txs:
-            neighbor_tx_df = neighbor_tx_df.nlargest(max_txs, 'timeStamp', keep='first')
-        
-        neighbor_dfs.append(neighbor_tx_df)
-        
-        neighbor_graph, neighbor_addr_to_index = _build_graph_from_df(neighbor_tx_df, center_address=None)
-        if neighbor_graph is not None:
-            neighbor_graphs.append((neighbor, neighbor_graph, neighbor_addr_to_index))
-    
-    if neighbor_dfs:
-        combined_df = pd.concat([target_tx_df] + neighbor_dfs, ignore_index=True)
-    else:
-        combined_df = target_tx_df
-    
-    main_graph, main_addr_to_index = _build_graph_from_df(combined_df, center_address=address)
+        neighbor_dfs.append(neighbor_tx_df.tail(max_txs))
+        graph, indices = _build_graph_from_df(neighbor_tx_df, center_address=neighbor)
+        if graph is not None:
+            neighbor_graphs.append((neighbor, graph, indices))
+    combined_df = deduplicate_transactions(pd.concat([target_tx_df] + neighbor_dfs, ignore_index=True))
+    main_graph, main_indices = _build_graph_from_df(combined_df, center_address=address)
+    return main_graph, main_indices, neighbor_graphs
 
-    if max_neighbors == 0:
-        neighbor_graphs = []
-
-    return main_graph, main_addr_to_index, neighbor_graphs
 
 def extract_node_features(df):
+    df = df.copy()
     if 'value_eth' not in df.columns or 'value_normalized' not in df.columns:
         df = _add_unit_safe_values(df)
     df['gasUsed'] = pd.to_numeric(df['gasUsed'], errors='coerce').fillna(0)
@@ -330,7 +311,7 @@ def extract_node_features(df):
     lifetime_features['lifetime_days'] = lifetime_features['lifetime_seconds'] / max(86400, 1)
     
     financial_features = pd.DataFrame(index=pd.unique(df[['from', 'to']].values.ravel('K')))
-    financial_features['net_flow'] = 0
+    financial_features['net_flow'] = 0.0
     financial_features['in_out_ratio'] = 0
     
     sent_amounts = df.groupby('from')['value_eth'].sum()
@@ -342,7 +323,7 @@ def extract_node_features(df):
     out_degree = df.groupby('from').size()
     in_degree = df.groupby('to').size()
     
-    financial_features['in_out_ratio'] = in_degree / (out_degree + 1)
+    financial_features['in_out_ratio'] = in_degree.reindex(financial_features.index, fill_value=0) / (out_degree.reindex(financial_features.index, fill_value=0) + 1)
     financial_features['in_out_ratio'] = financial_features['in_out_ratio'].fillna(0)
     
     counterparty_features = pd.DataFrame(index=pd.unique(df[['from', 'to']].values.ravel('K')))
@@ -364,22 +345,13 @@ def extract_node_features(df):
     large_in_tx['large_tx_in_count'] = 0
     large_in_tx['large_tx_in_ratio'] = 0
     
-    if large_tx_threshold > 0:
-        large_out_df = df[df['value_eth'] > large_tx_threshold].groupby('from').agg(
-            large_tx_out_count=('value_eth', 'count'),
-            large_tx_out_ratio=('value_eth', lambda x: len(x) / max(len(df[df['from'] == x.name]), 1))
-        )
-        
-        large_in_df = df[df['value_eth'] > large_tx_threshold].groupby('to').agg(
-            large_tx_in_count=('value_eth', 'count'),
-            large_tx_in_ratio=('value_eth', lambda x: len(x) / max(len(df[df['to'] == x.name]), 1))
-        )
-        
-        if not large_out_df.empty:
-            large_out_tx = large_out_tx.combine_first(large_out_df)
-        if not large_in_df.empty:
-            large_in_tx = large_in_tx.combine_first(large_in_df)
-    
+    if pd.notna(large_tx_threshold) and large_tx_threshold > 0:
+        large_rows = df[df['value_eth'].gt(large_tx_threshold)]
+        large_out_tx['large_tx_out_count'] = large_rows.groupby('from').size().reindex(large_out_tx.index, fill_value=0)
+        large_in_tx['large_tx_in_count'] = large_rows.groupby('to').size().reindex(large_in_tx.index, fill_value=0)
+        large_out_tx['large_tx_out_ratio'] = large_out_tx['large_tx_out_count'] / out_degree.reindex(large_out_tx.index, fill_value=0).clip(lower=1)
+        large_in_tx['large_tx_in_ratio'] = large_in_tx['large_tx_in_count'] / in_degree.reindex(large_in_tx.index, fill_value=0).clip(lower=1)
+
     all_features_list = []
     
     feature_groups = [

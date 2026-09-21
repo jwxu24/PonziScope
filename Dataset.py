@@ -15,8 +15,23 @@ import torch
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
 from collections import defaultdict
+from pathlib import Path
+from Data_protocol import ROOT, END_BLOCK
 
 TX_TYPES = ['Normal', 'Internal', 'ERC20']
+
+
+def transaction_cache_complete(path, end_block):
+    path = Path(path)
+    metadata = path.with_suffix('.meta.json')
+    if not path.exists() or not metadata.exists():
+        return False
+    try:
+        info = json.loads(metadata.read_text(encoding='utf-8'))
+    except (ValueError, OSError):
+        return False
+    return (info.get('complete') is True and info.get('format_version') == 2
+            and info.get('start_block') == 0 and info.get('end_block') == end_block)
 
 
 def get_all_datasets():
@@ -38,7 +53,7 @@ def get_all_datasets():
     return datasets
 
 
-def GetAddressRelatedTransactions(dataset=None):
+def GetAddressRelatedTransactions(dataset=None, end_block=END_BLOCK):
     """
     获取与地址相关的交易数据
     
@@ -82,19 +97,9 @@ def GetAddressRelatedTransactions(dataset=None):
             all_addresses.extend([(row['Address'], row['VerifiedLabel']) for _, row in ponzi_df.iterrows()])
             print(f"从 {ds}.csv 加载了 {len(ponzi_df)} 个地址")
     
-    # 去重，保留唯一地址（保留第一个出现的标签）
-    seen = set()
-    addresses_with_labels = []
-    for addr, label in all_addresses:
-        if addr not in seen:
-            seen.add(addr)
-            addresses_with_labels.append((addr, label))
-    
-    addresses = [addr for addr, _ in addresses_with_labels]
-    print(f"去重后共 {len(addresses)} 个地址")
-    
-    # 保存地址列表到 addresses.csv（供后续函数使用）
-    addresses_df = pd.DataFrame(addresses_with_labels, columns=['Address', 'VerifiedLabel'])
+    addresses = sorted({str(addr).strip().lower() for addr, _ in all_addresses})
+    print(f'Unique addresses: {len(addresses)}')
+    addresses_df = pd.DataFrame({'Address': addresses})
     addresses_df.to_csv("Dataset/PonziCombine/addresses.csv", index=False)
     print(f"地址列表已保存到 Dataset/PonziCombine/addresses.csv")
     
@@ -102,10 +107,9 @@ def GetAddressRelatedTransactions(dataset=None):
         for tt in ['Normal/', 'Internal/', 'ERC20/']:
             # 检查该地址的交易文件是否已经存在
             file_path = f"{relatedTransactionPath}{tt}{address}.csv"
-            if not os.path.exists(file_path):
-                # 如果文件不存在，则获取该地址的交易数据
+            if not transaction_cache_complete(file_path, end_block):
                 try:
-                    data.getTotalDatafromScan(address, tt, f"{relatedTransactionPath}{tt}")
+                    data.getTotalDatafromScan(address, tt, f"{relatedTransactionPath}{tt}", end_number=end_block)
                     time.sleep(0.1)  # 添加延时，避免API请求过于频繁
                 except Exception as e:
                     print(f"Error processing {address} for {tt}: {e}")
@@ -204,7 +208,7 @@ def GetRelatedAddressLabel(reverse=False):
                 json.dump(address_labels, f)
     
 
-def GetRelatedAddressTransactions(reverse=False, use_reverse_file=False):
+def GetRelatedAddressTransactions(reverse=False, use_reverse_file=False, end_block=END_BLOCK):
     """
     获取相关地址的交易数据
     
@@ -250,22 +254,15 @@ def GetRelatedAddressTransactions(reverse=False, use_reverse_file=False):
         print(f"共有 {len(related_addresses)} 个相关地址需要获取交易数据")
     
     for address in tqdm.tqdm(related_addresses):
-        # 检查该地址的三类交易文件是否存在任意一个
-        transaction_types = ['Normal/', 'Internal/', 'ERC20/']
-        existing_files = [tt for tt in transaction_types if os.path.exists(f"{relatedAddressTransactionPath}{tt}{address}.csv")]
-        
-        if existing_files:
-            # tqdm.tqdm.write(f"跳过地址 {address}: 已存在交易文件 {', '.join([t.replace('/', '') for t in existing_files])}")
-            
-            continue
-            
-        # tqdm.tqdm.write(f"处理地址 {address}: 无现有交易文件")
-        # 获取交易数据
-        for tt in transaction_types:
+        address = address.strip().lower()
+        for tt in ['Normal/', 'Internal/', 'ERC20/']:
+            path = f'{relatedAddressTransactionPath}{tt}{address}.csv'
+            if transaction_cache_complete(path, end_block):
+                continue
             try:
-                data.getTotalDatafromScan(address, tt, f"{relatedAddressTransactionPath}{tt}")
-            except Exception as e:
-                print(f"获取 {address} 的 {tt} 交易失败: {e}")
+                data.getTotalDatafromScan(address, tt, f'{relatedAddressTransactionPath}{tt}', end_number=end_block)
+            except Exception as exc:
+                print(f'Failed to fetch {address} {tt}: {exc}')
 
 # 特征提取功能
 def extract_node_features(addr, is_center, tx_types, cache_dict=None):
@@ -529,11 +526,10 @@ def extract_and_save_features(is_center=True, batch_size=200, num_workers=None):
             # Parallel check for transaction files
             valid_addresses = []
             with ThreadPoolExecutor(max_workers=check_workers) as executor:
-                futures = [executor.submit(has_tx_files, addr) for addr in addresses]
-                for i, future in enumerate(tqdm.tqdm(as_completed(futures), total=len(futures), 
-                                           desc="Checking transaction files")):
+                futures = {executor.submit(has_tx_files, addr): addr for addr in addresses}
+                for future in tqdm.tqdm(as_completed(futures), total=len(futures), desc="Checking transaction files"):
                     if future.result():
-                        valid_addresses.append(addresses[i])
+                        valid_addresses.append(futures[future])
             
             print(f"Filtered down to {len(valid_addresses)} addresses with transaction files")
             addresses = valid_addresses
@@ -800,14 +796,17 @@ if __name__ == "__main__":
     parser.add_argument("--reverse", action="store_true", help="反向处理地址列表")
     parser.add_argument("--use_reverse_file", action="store_true", help="使用address_labels_reverse.json文件")
     
+    parser.add_argument("--dataset", choices=["Dataset1", "Dataset2"])
+    parser.add_argument("--end_block", type=int, default=END_BLOCK)
     args = parser.parse_args()
+    os.chdir(ROOT)
     
     if args.get_transactions:
-        GetAddressRelatedTransactions()  # 自动处理所有数据集
+        GetAddressRelatedTransactions(args.dataset, args.end_block)
     if args.get_labels:
         GetRelatedAddressLabel(args.reverse)
     if args.get_address_transactions:
-        GetRelatedAddressTransactions(args.reverse, args.use_reverse_file)
+        GetRelatedAddressTransactions(args.reverse, args.use_reverse_file, args.end_block)
     if args.extract_center_features:
         extract_and_save_features(is_center=True, batch_size=args.batch_size, num_workers=args.workers)
     if args.extract_neighbor_features:

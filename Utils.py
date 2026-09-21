@@ -1,4 +1,3 @@
-from cgitb import text
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -6,6 +5,8 @@ from bs4 import BeautifulSoup
 import random
 import json
 import pandas as pd
+from pathlib import Path
+from Data_protocol import END_BLOCK, write_json
 
 class DataSource:
     """
@@ -50,7 +51,16 @@ class DataSource:
         url_params = "&".join([f"{k}={v}" for k, v in params.items()])
         url = f"https://api.etherscan.io/v2/api?{url_params}"
         
-        return getDataFromUrl(url, self.headers).json()["result"]
+        response = getDataFromUrl(url, self.headers)
+        if response is None:
+            raise RuntimeError('Etherscan request failed')
+        payload = response.json()
+        result = payload.get('result')
+        if isinstance(result, list) and (payload.get('status') == '1' or payload.get('message') == 'No transactions found'):
+            return result
+        if payload.get('message') == 'No transactions found':
+            return []
+        raise RuntimeError('Etherscan did not return a successful transaction list')
 
     def getNormalTransactionsbyAddress(self, address, startblock, endblock, page, offset=10000, sort="asc"):
         """Get a list of 'Normal' Transactions By Address"""
@@ -72,7 +82,16 @@ class DataSource:
         url_params = "&".join([f"{k}={v}" for k, v in params.items()])
         url = f"https://api.etherscan.io/v2/api?{url_params}"
         
-        return getDataFromUrl(url, self.headers).json()["result"]
+        response = getDataFromUrl(url, self.headers)
+        if response is None:
+            raise RuntimeError('Etherscan request failed')
+        payload = response.json()
+        result = payload.get('result')
+        if isinstance(result, list) and (payload.get('status') == '1' or payload.get('message') == 'No transactions found'):
+            return result
+        if payload.get('message') == 'No transactions found':
+            return []
+        raise RuntimeError('Etherscan did not return a successful transaction list')
 
     def getERCTokenTransferbyAddress(self, action, address, startblock, endblock, page, offset=10000, contractaddress="", sort="asc"):
         """
@@ -91,60 +110,60 @@ class DataSource:
     # unit and cannot be converted with the ETH 1e18 divisor.
     CORE_COLUMNS = [
         'blockNumber', 'from', 'to', 'value', 'gasUsed', 'gasPrice', 'timeStamp',
-        'contractAddress', 'tokenDecimal', 'tokenSymbol'
+        'contractAddress', 'tokenDecimal', 'tokenSymbol', 'hash', 'traceId',
+        'logIndex', 'transactionIndex', 'isError', 'txreceipt_status'
     ]
     
-    def getTotalDatafromScan(self, address, ttype, saved_path, start_number=0, end_number=99999999):
-        """Fetch transactions and retain the metadata required for unit-safe values."""
-        saved_path_address = f"{saved_path}{address}.csv"
-        response_list = []
-        
-        # Map transaction type to corresponding method
-        type_method_map = {
-            'Normal/': lambda: self.getNormalTransactionsbyAddress(address, start_number, end_number, 1),
-            'Internal/': lambda: self.getInternalTransactionsbyAddress(address, start_number, end_number, 1),
-            'ERC20/': lambda: self.getERCTokenTransferbyAddress('tokentx', address, start_number, end_number, 1)
+    def getTotalDatafromScan(self, address, ttype, saved_path, start_number=0, end_number=END_BLOCK):
+        if start_number < 0 or end_number < start_number:
+            raise ValueError('Invalid block interval')
+        address = address.strip().lower()
+        path = Path(saved_path) / f'{address}.csv'
+        methods = {
+            'Normal/': lambda start, end, page: self.getNormalTransactionsbyAddress(address, start, end, page),
+            'Internal/': lambda start, end, page: self.getInternalTransactionsbyAddress(address, start, end, page),
+            'ERC20/': lambda start, end, page: self.getERCTokenTransferbyAddress('tokentx', address, start, end, page),
         }
-        
-        max_attempts = 2
-        attempt_count = 0
-        
-        while attempt_count < max_attempts:
-            # Get transaction data based on type
-            if ttype not in type_method_map:
-                return False, 0
-                
-            response = type_method_map[ttype]()
-            
-            if not response:
-                return False, 0
-                
-            # 只保留核心列，减少数据量
-            filtered_response = []
-            metadata_columns = {'contractAddress', 'tokenDecimal', 'tokenSymbol'}
-            for tx in response:
-                filtered_tx = {
-                    col: tx.get(col, '' if col in metadata_columns else '0')
-                    for col in self.CORE_COLUMNS
-                }
-                filtered_response.append(filtered_tx)
-            
-            response_list.extend(filtered_response)
-            
-            # If less than max results returned, we've got all data
-            if len(response) < 10000:
-                if response_list:
-                    pd.DataFrame(response_list).to_csv(saved_path_address, index=None)
-                return True, len(response_list)
-                
-            # Update start block for next batch
-            start_number = int(response[-1]["blockNumber"])
-            attempt_count += 1
-            
-        # If we've reached max attempts, save what we have and return
-        if response_list:
-            pd.DataFrame(response_list).to_csv(saved_path_address, index=None)
-        return True, len(response_list)
+        if ttype not in methods:
+            raise ValueError(f'Unknown transaction type: {ttype}')
+        fetch = methods[ttype]
+        pending = [(start_number, end_number)]
+        rows = []
+        while pending:
+            lower, upper = pending.pop()
+            response = fetch(lower, upper, 1)
+            if not isinstance(response, list) or any(not isinstance(item, dict) for item in response):
+                raise RuntimeError('Invalid transaction response; no cache was written')
+            if len(response) >= 10000 and lower < upper:
+                midpoint = (lower + upper) // 2
+                pending.extend([(midpoint + 1, upper), (lower, midpoint)])
+                continue
+            rows.extend(response)
+            page = 1
+            previous_page = json.dumps(response, sort_keys=True)
+            while len(response) >= 10000:
+                page += 1
+                response = fetch(lower, upper, page)
+                if not isinstance(response, list) or any(not isinstance(item, dict) for item in response):
+                    raise RuntimeError('Single-block pagination failed; no cache was written')
+                current_page = json.dumps(response, sort_keys=True)
+                if current_page == previous_page:
+                    raise RuntimeError('Repeated transaction page; no cache was written')
+                previous_page = current_page
+                rows.extend(response)
+        frame = pd.DataFrame([{key: row.get(key, '') for key in self.CORE_COLUMNS} for row in rows], columns=self.CORE_COLUMNS)
+        if not frame.empty:
+            blocks = pd.to_numeric(frame['blockNumber'], errors='coerce')
+            if not blocks.between(start_number, end_number).all():
+                raise ValueError('API returned transactions outside the requested block range')
+            frame = frame.assign(_block=blocks).sort_values('_block', kind='stable').drop(columns='_block')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix('.csv.tmp')
+        frame.to_csv(temporary, index=False)
+        temporary.replace(path)
+        write_json(path.with_suffix('.meta.json'), {'complete': True, 'format_version': 2,
+                   'start_block': start_number, 'end_block': end_number, 'row_count': len(frame)})
+        return True, len(frame)
 
     def getTransactionCountfromRPC(self, address):
         """Get transaction count for an address using RPC"""
